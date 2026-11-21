@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=Stillframe
+GenericName=Screenshot Tool
+Comment=Capture, annotate, and record your screen offline
+Exec={executable}
+Icon={icon}
+Terminal=false
+Categories=Utility;
+Keywords=Screenshot;Snipping;Screen Capture;Screen Recorder;
+StartupNotify=true
+StartupWMClass=Stillframe
+Actions=Rectangle;Fullscreen;
+
+[Desktop Action Rectangle]
+Name=Capture a Rectangle
+Exec={executable} --capture region
+
+[Desktop Action Fullscreen]
+Name=Capture All Displays
+Exec={executable} --capture screen

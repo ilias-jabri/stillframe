@@ -1,0 +1,58 @@
+@define-color base #151515;
+@define-color bar #1c1c1c;
+@define-color line #343434;
+@define-color ink #eeeeee;
+@define-color quiet #ababab;
+@define-color focus #e1e1e1;
+
+window.stillframe, window.record-panel { background: @base; color: @ink; }
+window.stillframe.solid-csd decoration { background-color: @bar; border: 1px solid @line; }
+headerbar.still-header {
+  min-height: 39px; padding: 0 8px; border: 0; border-bottom: 1px solid @line;
+  background: @bar; color: @ink; box-shadow: none;
+}
+headerbar.still-header button.titlebutton { min-height: 24px; min-width: 24px; padding: 0; }
+.brand { font-size: 13px; font-weight: 800; letter-spacing: .15px; }
+.capture-bar { background: @bar; padding: 6px 9px; }
+.editor-bar { background: #181818; border-top: 1px solid @line; border-bottom: 1px solid @line; padding: 3px 9px; }
+.footer { background: @bar; border-top: 1px solid @line; padding: 2px 7px 2px 9px; }
+button.command {
+  color: @ink; background: #282828; border: 1px solid #454545; box-shadow: none;
+  min-height: 26px; padding: 0 7px; border-radius: 5px; font-size: 12px;
+}
+button.command:hover { background: #363636; border-color: #5a5a5a; }
+button.command:checked, button.command.active { background: #393939; border-color: #636363; color: @ink; }
+button.command:disabled { background: #232323; border-color: #333333; color: #878787; }
+button.primary {
+  color: @theme_selected_fg_color; background: @theme_selected_bg_color;
+  border-color: shade(@theme_selected_bg_color, 1.15); font-weight: 700; padding: 0 9px;
+}
+button.primary:hover { background: shade(@theme_selected_bg_color, 1.08); }
+button.tool, button.zoom {
+  color: #c7c7c7; background: transparent; border: 1px solid transparent; box-shadow: none;
+  min-height: 24px; min-width: 24px; padding: 0 2px; border-radius: 5px; font-size: 12px;
+}
+button.tool:hover, button.zoom:hover { background: #303030; color: @ink; }
+button.tool:checked, button.tool.active, button.zoom.active { background: #363636; color: #fafafa; border-color: #585858; }
+button.tool.active { box-shadow: inset 0 -2px #ababab; }
+button.tool:disabled, button.zoom:disabled { color: #757575; background: transparent; box-shadow: none; }
+button:focus-visible { outline-color: @focus; }
+separator.vertical { background: @line; min-width: 1px; margin-left: 1px; margin-right: 1px; }
+.stillframe scrolledwindow, .stillframe viewport, .stage { background: #101010; }
+label.quiet { color: @quiet; }
+label.status { color: @quiet; font-size: 11px; }
+label.hero { color: @ink; font-weight: 800; font-size: 21px; }
+label.hero-desc { color: @quiet; font-size: 12px; }
+label.keys { color: #a3a3a3; font-size: 11px; }
+label.menu-heading { color: @quiet; font-size: 11px; padding: 2px 3px 3px; }
+popover.still-popover { background: #242424; color: @ink; border: 1px solid #484848; border-radius: 7px; }
+button.menu-row {
+  min-height: 26px; padding: 0 6px; background: transparent; color: @ink;
+  border: 1px solid transparent; border-radius: 4px; box-shadow: none; font-size: 12px;
+}
+button.menu-row:hover, button.menu-row.active { background: #3b3b3b; }
+button.menu-row:disabled { color: #878787; }
+button.swatch { padding: 2px; min-width: 20px; min-height: 20px; }
+label.recording { color: #ffb5b5; font-weight: 700; }
+button.danger { background: #383838; color: #fff; border-color: #606060; }
+button.danger:hover { background: #484848; border-color: #7a7a7a; }

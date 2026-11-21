@@ -1,0 +1,137 @@
+#!/usr/bin/python3
+"""Install Stillframe for the current Linux desktop user."""
+
+import argparse
+from hashlib import sha256
+import os
+from pathlib import Path
+import re
+import shlex
+import tempfile
+
+from gi.repository import Gio, GLib
+
+
+SOURCE = Path(__file__).resolve().parent
+FILES = ("stillframe", "artwork.py", "capture.py", "editor.py", "local_sockets.py",
+         "recording.py", "style.css", "stillframe.png")
+APP_ID = "io.stillframe.Capture"
+BINDING = "<Super><Shift>s"
+KEYS_SCHEMA = "org.cinnamon.desktop.keybindings"
+
+
+def write_file(destination, contents, mode=0o644):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(contents)
+            stream.flush()
+            temporary.chmod(mode)
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def desktop_exec(path):
+    # Desktop Entry Exec arguments have an escaping layer inside the key file.
+    escaped = "".join("\\" + char if char in '\\"$`' else char for char in str(path))
+    return ('"' + escaped + '"').replace("\\", "\\\\").replace("%", "%%")
+
+
+def install():
+    data = Path(GLib.get_user_data_dir())
+    app = data / "stillframe"
+    for filename in FILES:
+        write_file(app / filename, (SOURCE / filename).read_bytes(),
+                   0o755 if filename == "stillframe" else 0o644)
+
+    executable = app / "stillframe"
+    run = desktop_exec(executable)
+    # Cinnamon caches absolute icon paths. Change the path when the artwork changes.
+    artwork = (app / "stillframe.png").read_bytes()
+    icon_file = app / f"stillframe-{sha256(artwork).hexdigest()[:12]}.png"
+    write_file(icon_file, artwork)
+    icon = str(icon_file).replace("\\", "\\\\")
+    launcher = data / "applications" / (APP_ID + ".desktop")
+    template = (SOURCE / "packaging" / "stillframe.desktop.in").read_text(encoding="utf-8")
+    write_file(launcher, template.format(executable=run, icon=icon).encode())
+    print(f"Installed Stillframe in the app menu ({launcher})")
+    return executable
+
+
+def normalized(binding):
+    mods = re.findall(r"<([^>]+)>", binding.casefold())
+    mods = ["super" if mod == "mod4" else mod for mod in mods]
+    return set(mods), binding.rsplit(">", 1)[-1].casefold()
+
+
+def register_shortcut(executable):
+    source = Gio.SettingsSchemaSource.get_default()
+    schema = source.lookup(KEYS_SCHEMA, True)
+    custom_schema = source.lookup(KEYS_SCHEMA + ".custom-keybinding", True)
+    if schema is None or custom_schema is None:
+        print("The global shortcut is available on Cinnamon.")
+        return
+
+    root = Gio.Settings.new_full(schema, None, None)
+    bindings = root.get_strv("custom-list")
+    shortcut_title = "Stillframe — Rectangle"
+    command = f"{shlex.quote(str(executable))} --capture region"
+
+    def custom(key):
+        path = f"/org/cinnamon/desktop/keybindings/custom-keybindings/{key}/"
+        return Gio.Settings.new_full(custom_schema, None, path)
+
+    target = normalized(BINDING)
+    for key in bindings:
+        if key == "__dummy__":
+            continue
+        existing = custom(key)
+        if (existing.get_string("command") == command or
+            existing.get_string("name") == shortcut_title):
+            if (existing.get_string("command") == command and
+                existing.get_strv("binding") == [BINDING]):
+                print("Super+Shift+S opens Stillframe's rectangle selector.")
+            else:
+                print("Stillframe already has a custom shortcut in Cinnamon.")
+            return
+        if any(normalized(binding) == target for binding in existing.get_strv("binding")):
+            print("Super+Shift+S is already assigned to a custom shortcut.")
+            return
+
+    for suffix in ("", ".media-keys", ".wm"):
+        other_schema = source.lookup(KEYS_SCHEMA + suffix, True)
+        if other_schema is None:
+            continue
+        settings = Gio.Settings.new_full(other_schema, None, None)
+        for key in other_schema.list_keys():
+            value = settings.get_value(key)
+            if key != "custom-list" and value.get_type_string() == "as":
+                if any(normalized(binding) == target for binding in value.unpack()):
+                    print("Super+Shift+S is already assigned in Cinnamon.")
+                    return
+
+    name = next(f"custom{index}" for index in range(len(bindings) + 1)
+                if f"custom{index}" not in bindings)
+    shortcut = custom(name)
+    shortcut.delay()
+    if (shortcut.set_string("name", shortcut_title) and shortcut.set_string("command", command)
+        and shortcut.set_strv("binding", [BINDING])):
+        shortcut.apply()
+        if root.set_strv("custom-list", [*bindings, name]):
+            Gio.Settings.sync()
+            if name in root.get_strv("custom-list"):
+                print("Super+Shift+S opens Stillframe's rectangle selector.")
+                return
+    print("Cinnamon could not save the global shortcut.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--shortcut", action="store_true",
+                        help="add Super+Shift+S if it is free in Cinnamon")
+    options = parser.parse_args()
+    executable = install()
+    if options.shortcut:
+        register_shortcut(executable)

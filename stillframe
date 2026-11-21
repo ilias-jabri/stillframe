@@ -1,0 +1,978 @@
+#!/usr/bin/python3
+"""Stillframe, a native desktop capture utility for local X11 sessions."""
+
+import argparse
+from datetime import datetime
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sys
+import time
+
+HERE = Path(__file__).resolve().parent
+
+# Keep X11 and file access local, including the GTK file chooser.
+os.environ["GDK_BACKEND"] = "x11"
+os.environ["GIO_USE_VFS"] = "local"
+os.environ["GIO_USE_PORTALS"] = "0"
+os.environ["GTK_USE_PORTAL"] = "0"
+os.environ["GIO_USE_VOLUME_MONITOR"] = "unix"
+os.environ["GIO_USE_NETWORK_MONITOR"] = "base"
+os.environ["GVFS_REMOTE_VOLUME_MONITOR_IGNORE"] = "1"
+
+if __name__ == "__main__":
+    from local_sockets import require_local_sockets
+
+    try:
+        require_local_sockets()
+    except OSError as error:
+        sys.exit(f"Could not enable Stillframe's local-only socket policy: {error}")
+
+import cairo
+import gi
+
+for namespace, version in (("Gtk", "3.0"), ("Gdk", "3.0"), ("GdkPixbuf", "2.0"),
+                           ("PangoCairo", "1.0"), ("Wnck", "3.0")):
+    gi.require_version(namespace, version)
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango
+
+from artwork import Document, emblem, empty_art, icon, rounded
+from capture import MODES, Selector, extract, pixel_bounds, snapshot
+from editor import CANVAS_PADDING, COLORS, DEFAULT_TOOL, TOOLS, Canvas
+from recording import Recording, available as recording_available
+
+
+PREFS = Path(GLib.get_user_config_dir()) / "stillframe" / "preferences.json"
+ZOOMS = (.0625, .125, .25, .33, .5, .67, .75, 1, 1.25, 1.5, 2, 3, 4)
+DELAYS = (0, 3, 5, 10)
+MAX_HISTORY = 40
+
+
+def style(widget, name):
+    widget.get_style_context().add_class(name)
+    return widget
+
+
+def label(text, css=None):
+    widget = Gtk.Label(label=text)
+    return style(widget, css) if css else widget
+
+
+def change_style(widget, name, enabled):
+    context = widget.get_style_context()
+    if enabled:
+        context.add_class(name)
+    else:
+        context.remove_class(name)
+
+
+class Glyph(Gtk.DrawingArea):
+    def __init__(self, name, size=17):
+        super().__init__()
+        self.name = name
+        self.size = size
+        self.set_size_request(size, size)
+        self.connect("draw", self.draw_glyph)
+
+    def draw_glyph(self, _widget, cr):
+        x = (self.get_allocated_width() - self.size) / 2
+        y = (self.get_allocated_height() - self.size) / 2
+        cr.translate(x, y)
+        if self.name == "brand":
+            emblem(cr, self.size)
+        elif isinstance(self.name, tuple):
+            rounded(cr, 1, 1, self.size - 2, self.size - 2, 4)
+            color = (.35, .35, .35) if self.get_state_flags() & Gtk.StateFlags.INSENSITIVE else self.name
+            cr.set_source_rgb(*color)
+            cr.fill_preserve()
+            cr.set_source_rgba(1, 1, 1, .24)
+            cr.set_line_width(1)
+            cr.stroke()
+        else:
+            context = self.get_style_context()
+            color = context.get_color(self.get_state_flags())
+            cr.set_source_rgba(color.red, color.green, color.blue, color.alpha)
+            icon(cr, self.name, 0, 0, self.size)
+        return False
+
+
+def button(name, text, callback=None, *, css="command", tooltip=None, menu=False,
+           disclosure=False):
+    widget = Gtk.MenuButton() if menu else Gtk.Button()
+    style(widget, css)
+    row = Gtk.Box(spacing=5)
+    if name:
+        row.pack_start(Glyph(name), False, False, 0)
+    if text:
+        row.pack_start(label(text), False, False, 0)
+    if disclosure:
+        row.pack_end(Glyph("down", 11), False, False, 0)
+    widget.add(row)
+    if tooltip or text:
+        widget.set_tooltip_text(tooltip or text)
+        widget.get_accessible().set_name(tooltip or text)
+    if callback:
+        widget.connect("clicked", lambda *_: callback())
+    return widget
+
+
+def divider(row):
+    row.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 1)
+
+
+def popover(anchor, title):
+    popup = style(Gtk.Popover.new(anchor), "still-popover")
+    anchor.set_popover(popup)
+    content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin=6)
+    heading = label(title, "menu-heading")
+    heading.set_xalign(0)
+    content.pack_start(heading, False, False, 0)
+    popup.add(content)
+    content.show_all()
+    return popup, content
+
+
+def menu_item(content, popup, name, text, callback):
+    def select():
+        popup.popdown()
+        callback()
+
+    item = button(name, text, select, css="menu-row")
+    item.set_halign(Gtk.Align.FILL)
+    item.get_child().set_halign(Gtk.Align.START)
+    content.pack_start(item, False, False, 0)
+    item.show_all()
+    return item
+
+
+class Window(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Stillframe")
+        style(self, "stillframe")
+        self.set_default_size(800, 540)
+        self.set_size_request(560, 365)
+        self.set_icon_from_file(str(HERE / "stillframe.png"))
+        self.connect("delete-event", self.on_close)
+        self.connect("key-press-event", self.on_key)
+        self.mode = "region"
+        self.delay = 0
+        self.auto_copy = True
+        self.read_preferences()
+        self.document = None
+        self.saved = None
+        self.original = None
+        self.source_name = ""
+        self.undo_stack = []
+        self.redo_stack = []
+        self.zoom_level = None
+        self.selector = None
+        self.countdown = None
+        self.capture_timer = 0
+        self.recording = None
+        self.record_panel = None
+        self.record_started = 0
+        self.record_clock = 0
+        self.record_stop = None
+        self.dialog_open = False
+        self.has_recorder = recording_available()
+        self.ink_color, self.highlight_color = COLORS["Coral"], COLORS["Amber"]
+
+        header = style(Gtk.HeaderBar(show_close_button=True), "still-header")
+        brand = Gtk.Box(spacing=7)
+        brand.pack_start(Glyph("brand", 22), False, False, 0)
+        brand.pack_start(label("Stillframe", "brand"), False, False, 0)
+        header.pack_start(brand)
+        settings = button("settings", None, css="tool", menu=True, tooltip="Preferences")
+        header.pack_end(settings)
+        self.set_titlebar(header)
+        self.build_settings(settings)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(root)
+        root.pack_start(self.build_capture_bar(), False, False, 0)
+        root.pack_start(self.build_editor_bar(), False, False, 0)
+        self.stage = self.build_stage()
+        root.pack_start(self.stage, True, True, 0)
+        root.pack_end(self.build_footer(), False, False, 0)
+        self.set_document(None)
+
+    def build_settings(self, settings):
+        popup, content = popover(settings, "Preferences")
+        auto = Gtk.CheckButton(label="Copy screenshots and edits to clipboard", active=self.auto_copy)
+        auto.connect("toggled", self.toggle_auto_copy)
+        content.pack_start(auto, False, False, 4)
+        auto.show()
+        menu_item(content, popup, None, "Keyboard shortcuts", self.show_shortcuts)
+
+    def build_capture_bar(self):
+        row = style(Gtk.Box(spacing=5), "capture-bar")
+        new = style(button("new", "New snip", self.begin_capture, tooltip="New snip (Ctrl+N)"),
+                    "primary")
+        row.pack_start(new, False, False, 0)
+        self.mode_button = button(self.mode, MODES[self.mode][0], menu=True, disclosure=True,
+                                  tooltip="Capture mode")
+        self.mode_glyph, self.mode_label, _ = self.mode_button.get_child().get_children()
+        row.pack_start(self.mode_button, False, False, 0)
+        popup, content = popover(self.mode_button, "Capture mode")
+        self.mode_items = {}
+        for mode, (name, _instruction) in MODES.items():
+            self.mode_items[mode] = menu_item(content, popup, mode, name,
+                                              lambda selected=mode: self.set_mode(selected))
+        self.set_mode(self.mode, persist=False)
+
+        self.delay_button = button("timer", "No delay", menu=True, disclosure=True,
+                                   tooltip="Capture delay")
+        _, self.delay_label, _ = self.delay_button.get_child().get_children()
+        row.pack_start(self.delay_button, False, False, 0)
+        popup, content = popover(self.delay_button, "Capture delay")
+        self.delay_items = {}
+        for delay in DELAYS:
+            self.delay_items[delay] = menu_item(content, popup, "timer", self.delay_name(delay),
+                                                lambda seconds=delay: self.set_delay(seconds))
+        self.set_delay(self.delay, persist=False)
+
+        if self.has_recorder:
+            record = button("record", "Record", menu=True, disclosure=True, tooltip="Screen recording")
+            row.pack_start(record, False, False, 0)
+            popup, content = popover(record, "Screen recording")
+            menu_item(content, popup, "region", "Record a rectangle",
+                      lambda: self.begin_recording("region"))
+            menu_item(content, popup, "screen", "Record all displays",
+                      lambda: self.begin_recording("screen"))
+
+        self.save_button = button("save", "Save", self.save_image, tooltip="Save image (Ctrl+S)")
+        row.pack_end(self.save_button, False, False, 0)
+        self.copy_button = button("copy", "Copy", self.copy_image, tooltip="Copy image (Ctrl+C)")
+        row.pack_end(self.copy_button, False, False, 0)
+        row.pack_end(button("open", None, self.open_image, tooltip="Open image (Ctrl+O)"),
+                     False, False, 0)
+        return row
+
+    def build_editor_bar(self):
+        row = style(Gtk.Box(spacing=2), "editor-bar")
+        self.tool_buttons = {}
+        for tool, (name, key) in TOOLS.items():
+            control = button(tool, None, lambda selected=tool: self.select_tool(selected),
+                             css="tool", tooltip=f"{name} ({key})")
+            row.pack_start(control, False, False, 0)
+            self.tool_buttons[tool] = control
+            if tool in ("eraser", "text"):
+                divider(row)
+        divider(row)
+        self.ink_button = button(COLORS["Coral"], "Ink", menu=True, css="tool",
+                                 tooltip="Ink color and thickness", disclosure=True)
+        self.ink_glyph = self.ink_button.get_child().get_children()[0]
+        row.pack_start(self.ink_button, False, False, 0)
+        popup, content = popover(self.ink_button, "Ink")
+        colors = Gtk.Box(spacing=2)
+        self.swatches = {}
+        for name, rgb in COLORS.items():
+            swatch = style(button(rgb, None, lambda color=rgb: self.select_color(color),
+                                  css="tool", tooltip=name), "swatch")
+            colors.pack_start(swatch, False, False, 0)
+            self.swatches[rgb] = swatch
+        content.pack_start(colors, False, False, 0)
+        line = Gtk.Box(spacing=5, margin=3)
+        line.pack_start(label("Width", "quiet"), False, False, 0)
+        width = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1, 24, 1)
+        width.set_value(5)
+        width.set_digits(0)
+        width.get_accessible().set_name("Ink width")
+        width.connect("value-changed", lambda slider: self.set_width(int(slider.get_value())))
+        line.pack_start(width, True, True, 0)
+        content.pack_start(line, False, False, 0)
+        content.show_all()
+        self.undo_button = button("undo", None, self.undo, css="tool", tooltip="Undo (Ctrl+Z)")
+        self.redo_button = button("redo", None, self.redo, css="tool", tooltip="Redo (Ctrl+Shift+Z)")
+        row.pack_end(self.redo_button, False, False, 0)
+        row.pack_end(self.undo_button, False, False, 0)
+        return row
+
+    def build_stage(self):
+        stage = style(Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
+                                transition_duration=130), "stage")
+        empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                        halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        art = Gtk.DrawingArea()
+        art.set_size_request(150, 116)
+
+        def draw_art(widget, cr):
+            empty_art(cr, widget.get_allocated_width(), widget.get_allocated_height())
+            return False
+
+        art.connect("draw", draw_art)
+        empty.pack_start(art, False, False, 0)
+        empty.pack_start(label("Capture or open an image", "hero"), False, False, 0)
+        empty.pack_start(label("Mark it up, then save or copy it.", "hero-desc"),
+                         False, False, 0)
+        keys = label("Ctrl+N  New snip     ·     Ctrl+O  Open image", "keys")
+        keys.set_margin_top(7)
+        empty.pack_start(keys, False, False, 0)
+        stage.add_named(empty, "empty")
+        self.scroller = Gtk.ScrolledWindow()
+        self.scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.canvas = Canvas(self.commit, self.zoom_by, self.prompt_text)
+        self.scroller.add(self.canvas)
+        self.scroller.connect("size-allocate", lambda *_: self.update_zoom())
+        stage.add_named(self.scroller, "image")
+        return stage
+
+    def build_footer(self):
+        footer = style(Gtk.Box(spacing=2), "footer")
+        self.status_label = label("Ready", "status")
+        self.status_label.set_xalign(0)
+        self.status_label.set_max_width_chars(68)
+        self.status_label.set_ellipsize(Pango.EllipsizeMode.END)
+        footer.pack_start(self.status_label, True, True, 0)
+        self.dimensions = label("", "status")
+        footer.pack_start(self.dimensions, False, False, 6)
+
+        self.zoom_controls = [
+            button("minus", None, lambda: self.zoom_by(-1), css="zoom", tooltip="Zoom out"),
+            button(None, "100%", lambda: self.set_zoom(1), css="zoom", tooltip="Actual size (Ctrl+1)"),
+            button("new", None, lambda: self.zoom_by(1), css="zoom", tooltip="Zoom in"),
+            button(None, "Fit", lambda: self.set_zoom(None), css="zoom", tooltip="Fit to window (Ctrl+0)"),
+        ]
+        self.zoom_text = self.zoom_controls[1].get_child().get_children()[0]
+        for control in self.zoom_controls:
+            footer.pack_start(control, False, False, 0)
+        return footer
+
+    def read_preferences(self):
+        try:
+            data = json.loads(PREFS.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                if data.get("mode") in MODES:
+                    self.mode = data["mode"]
+                if data.get("delay") in DELAYS:
+                    self.delay = data["delay"]
+                self.auto_copy = data.get("auto_copy", True) is True
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def write_preferences(self):
+        try:
+            PREFS.parent.mkdir(parents=True, exist_ok=True)
+            contents = json.dumps({"mode": self.mode, "delay": self.delay,
+                                   "auto_copy": self.auto_copy}, indent=2)
+            GLib.file_set_contents(str(PREFS), contents.encode())
+        except (OSError, GLib.Error) as error:
+            self.status(f"Preferences could not be saved · {error}")
+
+    def toggle_auto_copy(self, check):
+        self.auto_copy = check.get_active()
+        self.write_preferences()
+
+    def set_mode(self, mode, persist=True):
+        self.mode = mode
+        self.mode_glyph.name = mode
+        self.mode_glyph.queue_draw()
+        self.mode_label.set_text(MODES[mode][0])
+        for value, control in self.mode_items.items():
+            change_style(control, "active", value == mode)
+        if persist:
+            self.write_preferences()
+
+    @staticmethod
+    def delay_name(delay):
+        return f"{delay} seconds" if delay else "No delay"
+
+    def set_delay(self, delay, persist=True):
+        self.delay = delay
+        self.delay_label.set_text(self.delay_name(delay))
+        for value, control in self.delay_items.items():
+            change_style(control, "active", value == delay)
+        if persist:
+            self.write_preferences()
+
+    def set_document(self, document, name="", saved=False):
+        self.document = self.original = document
+        self.saved = document if saved else None
+        self.source_name = name
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.zoom_level = None
+        self.select_tool(DEFAULT_TOOL)
+        self.sync_document()
+
+    def sync_document(self):
+        self.canvas.set_document(self.document)
+        has_image = self.document is not None
+        self.stage.set_visible_child_name("image" if has_image else "empty")
+        self.dimensions.set_text("{} × {} px".format(*self.document.size) if has_image else "")
+        for control in (self.save_button, self.copy_button, *self.tool_buttons.values(),
+                        *self.zoom_controls):
+            control.set_sensitive(has_image)
+        self.sync_ink()
+        self.sync_history()
+        self.update_zoom()
+
+    def sync_history(self):
+        self.undo_button.set_sensitive(bool(self.undo_stack))
+        self.redo_button.set_sensitive(bool(self.redo_stack))
+
+    def sync_edit(self, message):
+        self.sync_document()
+        if self.auto_copy:
+            self.copy_image(notify=False)
+            message += " · Image copied"
+        self.status(message)
+
+    def commit(self, document, cropped):
+        self.undo_stack.append(self.document)
+        if len(self.undo_stack) > MAX_HISTORY:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+        self.document = document
+        if cropped:
+            self.select_tool(DEFAULT_TOOL)
+            self.sync_edit("Image cropped")
+        elif self.canvas.tool == "eraser":
+            self.sync_edit("Annotations erased")
+        else:
+            self.sync_edit(f"{TOOLS[self.canvas.tool][0]} added")
+
+    def undo(self):
+        if self.undo_stack:
+            self.redo_stack.append(self.document)
+            self.document = self.undo_stack.pop()
+            self.sync_edit("Edit undone")
+
+    def redo(self):
+        if self.redo_stack:
+            self.undo_stack.append(self.document)
+            self.document = self.redo_stack.pop()
+            self.sync_edit("Edit restored")
+
+    def select_tool(self, tool):
+        self.canvas.set_tool(tool)
+        for key, control in self.tool_buttons.items():
+            change_style(control, "active", key == tool)
+        self.sync_ink()
+        if tool in ("crop", "text", "redact", "eraser"):
+            self.status({"crop": "Drag around what you want to keep",
+                         "text": "Click where you want to add text",
+                         "redact": "Drag to cover an area with solid black",
+                         "eraser": "Click or drag across annotations to erase them"}[tool])
+        elif self.document:
+            self.status(TOOLS[tool][0])
+
+    def select_color(self, color):
+        if self.canvas.tool == "highlight":
+            self.highlight_color = color
+        else:
+            self.ink_color = color
+        self.sync_ink()
+
+    def set_width(self, width):
+        self.canvas.width = width
+
+    def sync_ink(self):
+        color = self.highlight_color if self.canvas.tool == "highlight" else self.ink_color
+        self.ink_button.set_sensitive(self.document is not None and
+                                      self.canvas.tool not in ("eraser", "redact", "crop"))
+        self.canvas.color = color
+        self.ink_glyph.name = color
+        self.ink_glyph.queue_draw()
+        for value, swatch in self.swatches.items():
+            change_style(swatch, "active", value == color)
+
+    def set_zoom(self, level):
+        if self.document:
+            self.zoom_level = level
+            self.update_zoom()
+
+    def update_zoom(self):
+        if not self.document:
+            return
+        width, height = self.document.size
+        if self.zoom_level is None:
+            padding = CANVAS_PADDING + 4
+            width_fit = (self.scroller.get_allocated_width() - padding) / width
+            height_fit = (self.scroller.get_allocated_height() - padding) / height
+            scale = max(.001, min(width_fit, height_fit, 1))
+        else:
+            scale = min(self.zoom_level, 30000 / max(width, height))
+        if self.canvas.scale != scale:
+            self.canvas.set_scale(scale)
+        self.zoom_text.set_text(f"{max(1, round(scale * 100))}%")
+        change_style(self.zoom_controls[-1], "active", self.zoom_level is None)
+        self.zoom_controls[0].set_sensitive(scale > ZOOMS[0] + .001)
+        self.zoom_controls[2].set_sensitive(scale < min(ZOOMS[-1], 30000 / max(width, height)) - .001)
+
+    def zoom_by(self, direction):
+        if not self.document:
+            return
+        current = self.canvas.scale
+        if direction > 0:
+            target = next((zoom for zoom in ZOOMS if zoom > current + .001), None)
+        else:
+            target = next((zoom for zoom in reversed(ZOOMS) if zoom < current - .001), None)
+        if target is not None:
+            self.set_zoom(target)
+
+    def status(self, text):
+        self.status_label.set_text(text)
+        self.status_label.set_tooltip_text(text)
+
+    def message(self, title, details, error=False):
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True, destroy_with_parent=True,
+                                   message_type=Gtk.MessageType.ERROR if error else Gtk.MessageType.INFO,
+                                   buttons=Gtk.ButtonsType.CLOSE, text=title)
+        dialog.format_secondary_text(details)
+        self.run_dialog(dialog)
+
+    def run_dialog(self, dialog):
+        self.dialog_open = True
+        try:
+            return dialog.run()
+        finally:
+            dialog.destroy()
+            self.dialog_open = False
+
+    def prompt_text(self):
+        dialog = Gtk.Dialog(title="Add text", transient_for=self, modal=True, destroy_with_parent=True)
+        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Add", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        entry = Gtk.Entry(placeholder_text="Type your annotation", width_chars=35,
+                          activates_default=True, margin=10)
+        dialog.get_content_area().pack_start(entry, True, True, 0)
+        dialog.show_all()
+        return entry.get_text().strip() if self.run_dialog(dialog) == Gtk.ResponseType.OK else ""
+
+    def may_replace(self):
+        if self.document is self.saved or self.document is self.original:
+            return True
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True, destroy_with_parent=True,
+                                   message_type=Gtk.MessageType.QUESTION, text="Save your edits?")
+        dialog.format_secondary_text("Your current image has unsaved changes.")
+        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                           "Discard edits", Gtk.ResponseType.REJECT, "Save", Gtk.ResponseType.ACCEPT)
+        decision = self.run_dialog(dialog)
+        return decision == Gtk.ResponseType.REJECT or (decision == Gtk.ResponseType.ACCEPT and
+                                                       self.save_image())
+
+    def on_close(self, *_):
+        if self.recording or self.capture_timer or self.selector or self.dialog_open:
+            return True
+        if not self.may_replace():
+            return True
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).store()
+        return False
+
+    def on_key(self, _widget, event):
+        state = event.state & Gtk.accelerator_get_default_mod_mask()
+        if not self.document or state or self.dialog_open:
+            return False
+        if event.keyval == Gdk.KEY_Escape:
+            self.select_tool(DEFAULT_TOOL)
+            return True
+        key = Gdk.keyval_name(event.keyval)
+        for tool, (_name, accelerator) in TOOLS.items():
+            if key and key.upper() == accelerator:
+                self.select_tool(tool)
+                return True
+        return False
+
+    def show_shortcuts(self):
+        self.message("Keyboard shortcuts",
+                     "Ctrl+N   New snip\nCtrl+O   Open image\nCtrl+S   Save image\n"
+                     "Ctrl+C   Copy image\nCtrl+Z / Ctrl+Shift+Z   Undo / redo\n"
+                     "Ctrl+0 / Ctrl+1   Fit / actual size\nCtrl+scroll   Zoom\nEsc   Cancel selection\n\n"
+                     "P  Pen    H  Highlighter    D  Eraser    A  Arrow\n"
+                     "R  Rectangle    E  Ellipse    T  Text    B  Redact    X  Crop")
+
+    def choose_file(self, action, title, default=None, video=False):
+        verb = "Save" if action == Gtk.FileChooserAction.SAVE else "Open"
+        dialog = Gtk.FileChooserDialog(title=title, transient_for=self, action=action,
+                                       modal=True, destroy_with_parent=True, local_only=True)
+        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, verb, Gtk.ResponseType.ACCEPT)
+        dialog.set_default_response(Gtk.ResponseType.ACCEPT)
+        filters = (("WebM video", ("*.webm",)),) if video else (
+            ("PNG image", ("*.png",)), ("JPEG image", ("*.jpg", "*.jpeg")),
+        )
+        if action == Gtk.FileChooserAction.OPEN:
+            filters = (("Images", ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp", "*.gif")),)
+        for name, patterns in filters:
+            file_filter = Gtk.FileFilter()
+            file_filter.set_name(name)
+            for pattern in patterns:
+                file_filter.add_pattern(pattern)
+                file_filter.add_pattern(pattern.upper())
+            dialog.add_filter(file_filter)
+        if default:
+            pictures = GLib.get_user_special_dir(
+                GLib.UserDirectory.DIRECTORY_VIDEOS if video else GLib.UserDirectory.DIRECTORY_PICTURES
+            )
+            if pictures and Path(pictures).is_dir():
+                dialog.set_current_folder(pictures)
+            dialog.set_current_name(default)
+            dialog.set_do_overwrite_confirmation(True)
+            if not video:
+                def change_extension(chooser, _property):
+                    current = chooser.get_current_name()
+                    if current:
+                        name = Path(current)
+                        if name.suffix.lower() in (".png", ".jpg", ".jpeg"):
+                            extension = ".png" if chooser.get_filter().get_name() == "PNG image" else ".jpg"
+                            chooser.set_current_name(name.with_suffix(extension).name)
+
+                dialog.connect("notify::filter", change_extension)
+
+        self.dialog_open = True
+        try:
+            while dialog.run() == Gtk.ResponseType.ACCEPT:
+                filename = dialog.get_filename()
+                if not filename:
+                    continue
+                path = Path(filename)
+                if action == Gtk.FileChooserAction.OPEN:
+                    return path
+                extension = path.suffix.lower()
+                if not extension:
+                    selected = dialog.get_filter().get_name()
+                    dialog.set_current_name(path.name + {
+                        "PNG image": ".png", "JPEG image": ".jpg", "WebM video": ".webm"
+                    }[selected])
+                    continue
+                if extension in ((".webm",) if video else (".png", ".jpg", ".jpeg")):
+                    return path
+                error = Gtk.MessageDialog(transient_for=dialog, modal=True,
+                                          message_type=Gtk.MessageType.ERROR,
+                                          buttons=Gtk.ButtonsType.CLOSE,
+                                          text="Use .webm for this recording." if video else
+                                          "Use .png, .jpg, or .jpeg for this image.")
+                error.run()
+                error.destroy()
+        finally:
+            dialog.destroy()
+            self.dialog_open = False
+        return None
+
+    @staticmethod
+    def timestamp():
+        return datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+
+    def open_image(self, path=None):
+        if self.dialog_open or self.selector or self.capture_timer or self.recording:
+            return
+        if not self.may_replace():
+            return
+        if path is None:
+            path = self.choose_file(Gtk.FileChooserAction.OPEN, "Open an image")
+        if path is None:
+            return
+        try:
+            image = GdkPixbuf.Pixbuf.new_from_file(str(path)).apply_embedded_orientation()
+        except GLib.Error as error:
+            self.message("Could not open the image", error.message, error=True)
+            return
+        self.set_document(Document(image), path.stem, saved=True)
+        self.status(f"Opened {path.name}")
+
+    def save_image(self):
+        if self.document is None or self.dialog_open:
+            return False
+        path = self.choose_file(Gtk.FileChooserAction.SAVE, "Save image", self.source_name + ".png")
+        if path is None:
+            return False
+        try:
+            image = self.document.rendered()
+            if path.suffix.lower() == ".png":
+                ok, data = image.save_to_bufferv("png", [], [])
+            else:
+                if image.get_has_alpha():
+                    width, height = self.document.size
+                    surface = cairo.ImageSurface(cairo.FORMAT_RGB24, width, height)
+                    cr = cairo.Context(surface)
+                    cr.set_source_rgb(1, 1, 1)
+                    cr.paint()
+                    Gdk.cairo_set_source_pixbuf(cr, image, 0, 0)
+                    cr.paint()
+                    image = Gdk.pixbuf_get_from_surface(surface, 0, 0, width, height)
+                ok, data = image.save_to_bufferv("jpeg", ["quality"], ["95"])
+            if not ok or not GLib.file_set_contents(str(path), bytes(data)):
+                raise OSError("The image could not be written.")
+        except (GLib.Error, OSError, cairo.Error) as error:
+            self.message("Could not save the image", str(error), error=True)
+            return False
+        self.saved = self.document
+        self.source_name = path.stem
+        self.status(f"Saved {path.name}")
+        return True
+
+    def copy_image(self, notify=True):
+        if self.document is None or self.dialog_open:
+            return
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_image(self.document.rendered())
+        if notify:
+            self.status("Image copied to clipboard")
+
+    def position_panel(self, panel, avoid=None, gap=18):
+        display = self.get_display()
+        _, x, y = display.get_default_seat().get_pointer().get_position()
+        bounds = display.get_monitor_at_point(x, y).get_geometry()
+        panel_width, panel_height = panel.get_size()
+        top = bounds.y + gap
+        bottom = bounds.y + bounds.height - panel_height - gap
+        positions = [(bounds.x + bounds.width - panel_width - gap, top),
+                     (bounds.x + gap, top),
+                     (bounds.x + bounds.width - panel_width - gap, bottom),
+                     (bounds.x + gap, bottom)]
+        if avoid:
+            left, upper, width, height = avoid
+            for px, py in positions:
+                if (px + panel_width <= left or px >= left + width or
+                        py + panel_height <= upper or py >= upper + height):
+                    panel.move(px, py)
+                    return
+        panel.move(*positions[0])
+
+    def make_panel(self, title, width):
+        panel = style(Gtk.Window(application=self.get_application(), title=title), "record-panel")
+        panel.set_default_size(width, 42)
+        panel.set_resizable(False)
+        panel.set_keep_above(True)
+        panel.stick()
+        return panel
+
+    def begin_capture(self, mode=None, delay=None):
+        if self.dialog_open or self.selector or self.capture_timer or self.recording:
+            return
+        if not self.may_replace():
+            return
+        mode = mode or self.mode
+        seconds_to_wait = self.delay if delay is None else delay
+        self.hide()
+        if seconds_to_wait:
+            deadline = time.monotonic() + seconds_to_wait
+            panel = self.make_panel("Stillframe countdown", 250)
+            self.countdown = panel
+            panel.set_skip_taskbar_hint(True)
+            row = Gtk.Box(spacing=9, margin=6)
+            remaining = label(f"Snip in {seconds_to_wait} seconds")
+            row.pack_start(remaining, True, True, 0)
+            row.pack_end(button(None, "Cancel", self.cancel_countdown), False, False, 0)
+            panel.add(row)
+
+            def closed(*_):
+                self.cancel_countdown()
+                return True
+
+            panel.connect("delete-event", closed)
+            panel.connect("key-press-event",
+                          lambda _panel, event: closed() if event.keyval == Gdk.KEY_Escape else False)
+            panel.show_all()
+            self.position_panel(panel)
+
+            def tick():
+                seconds = math.ceil(deadline - time.monotonic())
+                if seconds > 0:
+                    remaining.set_text(f"Snip in {seconds} {'second' if seconds == 1 else 'seconds'}")
+                    return GLib.SOURCE_CONTINUE
+                self.countdown.destroy()
+                self.countdown = None
+                self.capture_timer = GLib.timeout_add(170, self.take_snapshot, mode)
+                return GLib.SOURCE_REMOVE
+
+            self.capture_timer = GLib.timeout_add(60, tick)
+        else:
+            self.capture_timer = GLib.timeout_add(170, self.take_snapshot, mode)
+
+    def cancel_countdown(self):
+        if self.countdown:
+            GLib.source_remove(self.capture_timer)
+            self.capture_timer = 0
+            self.countdown.destroy()
+            self.countdown = None
+            self.present()
+            self.status("Capture canceled")
+
+    def take_snapshot(self, mode, destination=None):
+        self.capture_timer = 0
+        try:
+            pixels, width, height = snapshot()
+        except (RuntimeError, GLib.Error) as error:
+            self.present()
+            self.message("Could not capture the desktop", str(error), error=True)
+            return GLib.SOURCE_REMOVE
+
+        def selected(bounds, outline=None):
+            self.selector = None
+            if destination and bounds:
+                area = None if mode == "screen" else pixel_bounds(pixels, width, height, bounds)
+                self.start_recording(destination, area, None if mode == "screen" else bounds)
+                return
+            if not bounds:
+                self.present()
+                self.status("Capture canceled")
+                return
+            image = pixels if mode == "screen" else extract(pixels, width, height, bounds, outline)
+            self.present()
+            if image is None:
+                self.status("The selected area was too small")
+                return
+            self.set_document(Document(image), f"Snip {self.timestamp()}")
+            if self.auto_copy:
+                self.copy_image(notify=False)
+            self.status("Snip captured and copied" if self.auto_copy else "Snip captured")
+
+        if mode == "screen":
+            selected((0, 0, width, height))
+        else:
+            self.selector = Selector(pixels, width, height, mode, selected, bool(destination))
+        return GLib.SOURCE_REMOVE
+
+    def begin_recording(self, mode):
+        if self.dialog_open or self.selector or self.capture_timer or self.recording:
+            return
+        if not self.has_recorder:
+            self.message("Screen recording is unavailable",
+                         "The local GStreamer screen-capture or WebM encoder plugin is missing.",
+                         error=True)
+            return
+        path = self.choose_file(Gtk.FileChooserAction.SAVE, "Save screen recording",
+                                f"Recording {self.timestamp()}.webm", video=True)
+        if path is not None:
+            self.hide()
+            self.capture_timer = GLib.timeout_add(170, self.take_snapshot, mode, path)
+
+    def start_recording(self, path, pixel_area, logical_area):
+        def finished(error):
+            if self.record_clock:
+                GLib.source_remove(self.record_clock)
+                self.record_clock = 0
+            self.record_panel.destroy()
+            self.record_panel = None
+            self.recording = None
+            self.present()
+            if error:
+                self.status("Recording failed")
+                self.message("Could not save the recording", error, error=True)
+            else:
+                self.status(f"Saved {path.name}")
+
+        try:
+            self.recording = Recording(path, pixel_area, finished)
+        except (OSError, RuntimeError, GLib.Error) as error:
+            self.present()
+            self.message("Could not start the recording", str(error), error=True)
+            return
+
+        panel = self.make_panel("Stillframe recording", 220)
+        self.record_panel = panel
+        row = Gtk.Box(spacing=7, margin=6)
+        clock = label("●  00:00", "recording")
+        row.pack_start(clock, True, True, 0)
+        self.record_stop = style(button("stop", "Stop", self.stop_recording), "danger")
+        row.pack_end(self.record_stop, False, False, 0)
+        panel.add(row)
+        panel.connect("delete-event", lambda *_: self.finish_from_panel())
+        panel.connect("key-press-event",
+                      lambda _panel, event: self.finish_from_panel()
+                      if event.keyval == Gdk.KEY_Escape else False)
+        panel.show_all()
+        self.position_panel(panel, logical_area)
+        self.record_started = time.monotonic()
+
+        def tick():
+            minutes, seconds = divmod(int(time.monotonic() - self.record_started), 60)
+            clock.set_text(f"●  {minutes:02}:{seconds:02}")
+            return GLib.SOURCE_CONTINUE
+
+        self.record_clock = GLib.timeout_add(250, tick)
+        self.recording.start()
+
+    def finish_from_panel(self):
+        self.stop_recording()
+        return True
+
+    def stop_recording(self):
+        if self.recording and self.record_stop.get_sensitive():
+            self.record_stop.set_sensitive(False)
+            self.record_panel.hide()
+            self.recording.stop()
+
+
+class Application(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="io.stillframe.Capture",
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.window = None
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
+        provider = Gtk.CssProvider()
+        provider.load_from_path(str(HERE / "style.css"))
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        def add(name, method, *keys):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda *_: method())
+            self.add_action(action)
+            self.set_accels_for_action("app." + name, keys)
+
+        add("new", lambda: self.window.begin_capture(), "<Primary>n")
+        add("open", lambda: self.window.open_image(), "<Primary>o")
+        add("save", lambda: self.window.save_image(), "<Primary>s")
+        add("copy", lambda: self.window.copy_image(), "<Primary>c")
+        add("undo", lambda: self.window.undo(), "<Primary>z")
+        add("redo", lambda: self.window.redo(), "<Primary><Shift>z", "<Primary>y")
+        add("fit", lambda: self.window.set_zoom(None), "<Primary>0")
+        add("actual", lambda: self.window.set_zoom(1), "<Primary>1")
+        add("close", lambda: self.window.close(), "<Primary>q")
+
+    def do_activate(self):
+        if self.window is None:
+            self.window = Window(self)
+            self.window.connect("destroy", self.on_destroy)
+            self.window.show_all()
+        if self.window.recording:
+            self.window.record_panel.present()
+        elif not self.window.selector and not self.window.capture_timer:
+            self.window.present()
+
+    def on_destroy(self, _window):
+        self.window = None
+
+    def do_command_line(self, command_line):
+        options = arguments().parse_args(command_line.get_arguments()[1:])
+        if options.stop_recording:
+            if self.window:
+                self.window.stop_recording()
+            return 0
+        self.activate()
+        if options.capture:
+            self.window.begin_capture(options.capture, delay=0)
+        elif options.record:
+            self.window.begin_recording(options.record)
+        elif options.image:
+            path = Path(options.image)
+            if not path.is_absolute():
+                path = Path(os.fsdecode(command_line.get_cwd())) / path
+            self.window.open_image(path)
+        return 0
+
+
+def arguments():
+    parser = argparse.ArgumentParser(description="Native, offline screenshot and screen recording tool.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--capture", choices=MODES, help="start a screenshot")
+    group.add_argument("--record", choices=("region", "screen"), help="start a recording")
+    group.add_argument("--stop-recording", action="store_true", help="finish the current recording")
+    group.add_argument("image", nargs="?", help="open a local image")
+    return parser
+
+
+if __name__ == "__main__":
+    arguments().parse_args()
+    if not re.fullmatch(r"(?:unix/|unix)?:\d+(?:\.\d+)?", os.environ.get("DISPLAY", "")):
+        sys.exit("Stillframe requires a local X11 desktop session.")
+    if not Gtk.init_check()[0]:
+        sys.exit("Stillframe could not open the local X11 desktop.")
+    sys.exit(Application().run(sys.argv))

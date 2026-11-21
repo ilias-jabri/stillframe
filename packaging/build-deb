@@ -1,0 +1,63 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    printf 'Usage: %s VERSION [OUTPUT_DIR]\n' "$0" >&2
+    exit 2
+fi
+
+source_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+version=$1
+case $version in
+    ''|*[!0-9A-Za-z.+-]*)
+        printf 'Invalid package version: %s\n' "$version" >&2
+        exit 2 ;;
+esac
+dpkg --validate-version "$version"
+output_dir=${2:-"$source_dir/dist"}
+
+mkdir -p "$output_dir"
+stage=$(mktemp -d)
+trap 'rm -rf -- "$stage"' EXIT HUP INT TERM
+package="$stage/package"
+app="$package/usr/lib/stillframe"
+icons="$package/usr/share/icons/hicolor/128x128/apps"
+applications="$package/usr/share/applications"
+
+install -d "$app" "$icons" "$applications" "$package/DEBIAN" \
+    "$package/usr/bin" "$package/usr/share/doc/stillframe"
+install -m755 "$source_dir/stillframe" "$app/stillframe"
+for file in artwork.py capture.py editor.py local_sockets.py recording.py style.css stillframe.png; do
+    install -m644 "$source_dir/$file" "$app/$file"
+done
+ln -s ../lib/stillframe/stillframe "$package/usr/bin/stillframe"
+install -m644 "$source_dir/README.md" "$package/usr/share/doc/stillframe/README.md"
+
+icon_hash=$(sha256sum "$app/stillframe.png" | cut -c1-12)
+icon="io.stillframe.Capture-$icon_hash"
+install -m644 "$app/stillframe.png" "$icons/$icon.png"
+sed -e 's|{executable}|/usr/bin/stillframe|g' -e "s|{icon}|$icon|g" \
+    "$source_dir/packaging/stillframe.desktop.in" > "$applications/io.stillframe.Capture.desktop"
+
+cat > "$package/DEBIAN/control" <<CONTROL
+Package: stillframe
+Version: $version
+Architecture: all
+Maintainer: ilias-jabri <68255254+ilias-jabri@users.noreply.github.com>
+Section: graphics
+Priority: optional
+Installed-Size: $(du -sk "$package/usr" | cut -f1)
+Depends: python3 (>= 3.10), python3-gi, python3-gi-cairo, python3-cairo, gir1.2-gtk-3.0, gir1.2-gdkpixbuf-2.0, gir1.2-pango-1.0, gir1.2-wnck-3.0, libseccomp2, hicolor-icon-theme
+Recommends: gir1.2-gstreamer-1.0, gstreamer1.0-x, gstreamer1.0-plugins-good
+Homepage: https://github.com/ilias-jabri/stillframe
+Description: Offline screenshot and screen recording tool for X11
+ Take screenshots, annotate and crop them, and record your screen to WebM.
+ Stillframe is a native GTK application that processes captures locally.
+CONTROL
+chmod 644 "$package/DEBIAN/control" "$applications/io.stillframe.Capture.desktop"
+
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+    SOURCE_DATE_EPOCH=$(git -C "$source_dir" log -1 --format=%ct 2>/dev/null || date +%s)
+fi
+export SOURCE_DATE_EPOCH
+dpkg-deb --root-owner-group --build "$package" "$output_dir/stillframe_${version}_all.deb"
